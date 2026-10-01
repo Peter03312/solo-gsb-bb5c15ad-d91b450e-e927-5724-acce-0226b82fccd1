@@ -8,6 +8,7 @@ const { seedIfEmpty } = require('./seed');
 const replan = require('./replan');
 const labels = require('./labels');
 const shipments = require('./shipments');
+const evaluation = require('./evaluation');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -153,7 +154,8 @@ function mutateEvents(fn) {
       ret,
       invalidated: recomputeResult.invalidated,
       retired_rolls: recomputeResult.retiredRolls,
-      pending_shipments: recomputeResult.pendingShipments
+      pending_shipments: recomputeResult.pendingShipments,
+      stale_dispositions: recomputeResult.staleDispositions
     };
   })();
   return result;
@@ -185,8 +187,8 @@ app.put('/api/materials/:id', (req, res) => {
     ).run(code, name, JSON.stringify(allergens), req.params.id);
     if (!info.changes) return res.status(404).json({ error: '原料不存在' });
     // 过敏原被修改会改变批次推导结果，需要全量重算
-    const { invalidated, retired_rolls, pending_shipments } = mutateEvents(() => {});
-    res.json({ ok: true, invalidated, retired_rolls, pending_shipments });
+    const { invalidated, retired_rolls, pending_shipments, stale_dispositions } = mutateEvents(() => {});
+    res.json({ ok: true, invalidated, retired_rolls, pending_shipments, stale_dispositions });
   } catch (err) { badRequest(res, err); }
 });
 
@@ -260,7 +262,7 @@ function normalizeEquipment(body) {
 app.post('/api/events', (req, res) => {
   try {
     const body = normalizeEventBody(req.body);
-    const { ret, invalidated, retired_rolls, pending_shipments } = mutateEvents((d) => {
+    const { ret, invalidated, retired_rolls, pending_shipments, stale_dispositions } = mutateEvents((d) => {
       let batchId = null;
       if (body.type === 'PROCESS') {
         batchId = d.prepare('INSERT INTO batches (code) VALUES (?)')
@@ -281,7 +283,7 @@ app.post('/api/events', (req, res) => {
       }
       return eid;
     });
-    res.json({ id: ret, invalidated, retired_rolls, pending_shipments });
+    res.json({ id: ret, invalidated, retired_rolls, pending_shipments, stale_dispositions });
   } catch (err) { badRequest(res, err); }
 });
 
@@ -294,7 +296,7 @@ app.put('/api/events/:id', (req, res) => {
     if (body.type !== existing.type) {
       return res.status(400).json({ error: '事件类型（加工/清洗）不可变更，请删除后新建' });
     }
-    const { invalidated, retired_rolls, pending_shipments } = mutateEvents((d) => {
+    const { invalidated, retired_rolls, pending_shipments, stale_dispositions } = mutateEvents((d) => {
       if (body.type === 'PROCESS') {
         d.prepare('UPDATE batches SET code=? WHERE id=?')
           .run(body.batch_code, existing.batch_id);
@@ -312,7 +314,7 @@ app.put('/api/events/:id', (req, res) => {
         'UPDATE events SET event_time=?, equipment_id=?, note=? WHERE id=?'
       ).run(body.event_time, body.equipment_id, body.note, existing.id);
     });
-    res.json({ ok: true, invalidated, retired_rolls, pending_shipments });
+    res.json({ ok: true, invalidated, retired_rolls, pending_shipments, stale_dispositions });
   } catch (err) { badRequest(res, err); }
 });
 
@@ -322,7 +324,14 @@ app.delete('/api/events/:id', (req, res) => {
       'SELECT ev.id, ev.type, ev.batch_id, b.code AS batch_code FROM events ev LEFT JOIN batches b ON b.id = ev.batch_id WHERE ev.id=?'
     ).get(req.params.id);
     if (!existing) return res.status(404).json({ error: '事件不存在' });
-    const { invalidated, retired_rolls, pending_shipments } = mutateEvents((d) => {
+    // 批次连带删除时需要保留标签卷（含核销流水）与出货单据：这些表对 batches/label_rolls
+    // 带外键，而 foreign_keys pragma 在事务内为 no-op，故在事务开始前临时关闭、结束后恢复。
+    // 删除顺序已手工保证引用完整（先解绑卷、删事件与输入，再删批次；出货单 batch_id 置空）。
+    const needDetach = existing.type === 'PROCESS' && existing.batch_id;
+    if (needDetach) db.pragma('foreign_keys = OFF');
+    let result;
+    try {
+      result = mutateEvents((d) => {
       if (existing.type === 'PROCESS' && existing.batch_id) {
         const referenced = d.prepare(
           'SELECT COUNT(*) AS c FROM process_inputs WHERE batch_id=?'
@@ -338,15 +347,27 @@ app.delete('/api/events/:id', (req, res) => {
         }
         // 兜底：批次连带删除时，其名下仍有效的标签卷永久停用（通常不会走到，因放行需先删）
         labels.deactivateForBatchDeletion(d, existing.batch_id, existing.batch_code);
-        // 批次行将被删除（出货单 batch_id ON DELETE SET NULL，记录保留）；
-        // 停卷后同步把相关出货单置为待评估。
+        // 批次行将被删除（出货单 batch_id 置空，记录保留）；停卷后同步把相关出货单置为待评估。
         shipments.markPendingForRetirement(d);
+        // 标签卷不随批次删除：解除对批次的外键引用（卷快照已保留在出货明细中）。
+        d.prepare('UPDATE label_rolls SET batch_id = NULL WHERE batch_id = ?')
+          .run(existing.batch_id);
+        // 出货单的批次引用置空（shipment_versions/dispositions 不带外键，记录保留）。
+        d.prepare('UPDATE shipments SET batch_id = NULL WHERE batch_id = ?')
+          .run(existing.batch_id);
+        // 先删加工事件（process_inputs 随事件级联），再删批次：
+        // events.batch_id 为 NO ACTION 外键，批次必须在无事件引用时才能删除。
+        d.prepare('DELETE FROM process_inputs WHERE event_id = ?').run(existing.id);
         d.prepare('DELETE FROM batch_outputs WHERE batch_id=?').run(existing.batch_id);
         d.prepare('DELETE FROM batches WHERE id=?').run(existing.batch_id);
       }
       d.prepare('DELETE FROM events WHERE id=?').run(existing.id);
-    });
-    res.json({ ok: true, invalidated, retired_rolls, pending_shipments });
+      });
+    } finally {
+      if (needDetach) db.pragma('foreign_keys = ON');
+    }
+    const { invalidated, retired_rolls, pending_shipments, stale_dispositions } = result;
+    res.json({ ok: true, invalidated, retired_rolls, pending_shipments, stale_dispositions });
   } catch (err) { badRequest(res, err); }
 });
 
@@ -393,11 +414,16 @@ app.post('/api/releases', (req, res) => {
     if (!out || !ev) return res.status(400).json({ error: '该批次尚无加工记录，无法放行' });
 
     const snapshot = sortedJson(JSON.parse(out.allergens));
-    const info = db.prepare(
-      `INSERT INTO releases (batch_id, released_at, released_by, snapshot_allergens, status, created_event_seq)
-       VALUES (?,?,?,?,'ACTIVE',(SELECT COUNT(*) FROM events))`
-    ).run(batch_id, released_at, released_by, snapshot);
-    res.json({ id: info.lastInsertRowid });
+    let info;
+    // 新增放行可能让旧处置上下文（有效放行集合）变化：同一事务内核对旧结论是否需重新评估。
+    const txResult = db.transaction(() => {
+      info = db.prepare(
+        `INSERT INTO releases (batch_id, released_at, released_by, snapshot_allergens, status, created_event_seq)
+         VALUES (?,?,?,?,'ACTIVE',(SELECT COUNT(*) FROM events))`
+      ).run(batch_id, released_at, released_by, snapshot);
+      return evaluation.syncStaleDispositions(db);
+    })();
+    res.json({ id: info.lastInsertRowid, stale_dispositions: txResult });
   } catch (err) { badRequest(res, err); }
 });
 
@@ -409,13 +435,23 @@ app.delete('/api/releases/:id', (req, res) => {
   // 出货明细中的放行标识（release_id/release_at/release_by 快照）保留不删。
   let retired = [];
   let pending = [];
+  let staleDispositions = [];
   db.transaction(() => {
     const { rolls, reason } = labels.deactivateForReleaseDeletion(db, rel.id);
     retired = rolls.map((x) => ({ id: x.id, roll_code: x.roll_code, reason }));
     pending = shipments.markPendingForRetirement(db);
+    // 放行删除直接改变“有效放行”，且上面已停用名下卷：同一事务内把旧结论标为需重新评估。
+    staleDispositions = evaluation.syncStaleDispositions(db);
     db.prepare('DELETE FROM releases WHERE id=?').run(rel.id);
+    // 删除后 active_releases / release_exists 再次变化，补核对一次（删除本身也在同一事务内）。
+    staleDispositions = staleDispositions.concat(evaluation.syncStaleDispositions(db));
   })();
-  res.json({ ok: true, retired_rolls: retired, pending_shipments: pending });
+  res.json({
+    ok: true,
+    retired_rolls: retired,
+    pending_shipments: pending,
+    stale_dispositions: staleDispositions
+  });
 });
 
 // ---------- 过敏原标签卷 ----------
@@ -510,6 +546,40 @@ app.get('/api/batches/:id/shipment-balance', (req, res) => {
 app.get('/api/shipment-balances', (req, res) => {
   res.json(shipments.allBalances(db));
 });
+
+// ---------- 出货质量处置（整单） ----------
+// 查询评估视图：出货快照（过敏原/逐卷分配/放行快照）、当前批次过敏原/有效放行/所用卷停用原因、
+// 准予继续流转条件判定，以及查询时取得的状态版本（签名令牌，提交时原样回传）。
+app.get('/api/shipments/:idOrCode/evaluation', (req, res) => {
+  try {
+    res.json(evaluation.getEvaluation(db, req.params.idOrCode));
+  } catch (err) { sendEvaluationError(res, err); }
+});
+
+// 提交整单处置：body { decision:'CONTINUE'|'RECALL', decided_by, basis, version, decided_at? }
+// 事务内核对最新状态版本与上下文指纹；过期拒绝且不产生记录；记录只增不改。
+app.post('/api/shipments/:idOrCode/dispositions', (req, res) => {
+  try {
+    res.json(evaluation.submitDisposition(db, req.params.idOrCode, req.body || {}));
+  } catch (err) { sendEvaluationError(res, err); }
+});
+
+function sendEvaluationError(res, err) {
+  if (err && err.name === 'EvaluationError') {
+    if (err.code === 'SHIPMENT_NOT_FOUND') {
+      return res.status(404).json({ error: err.message, code: err.code, details: err.details });
+    }
+    const conflict = err.code === 'VERSION_EXPIRED' || err.code === 'CONTINUE_NOT_ALLOWED' ||
+      err.code === 'SHIPMENT_NOT_REVIEWABLE' || err.code === 'DISPOSITION_EXISTS';
+    return res.status(conflict ? 409 : 400).json({
+      error: err.message,
+      code: err.code,
+      details: err.details
+    });
+  }
+  console.error(err);
+  return res.status(500).json({ error: err && err.message ? err.message : '服务器内部错误' });
+}
 
 function sendShipmentError(res, err) {
   if (err && err.name === 'ShipmentError') {

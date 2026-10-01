@@ -151,6 +151,39 @@ function initSchema(d) {
     qty INTEGER NOT NULL CHECK (qty > 0)      -- 本卷分配张数（正整数）
   );
 
+  -- 出货质量处置（整单）：仅对“待评估（PENDING_REVIEW）”出货单登记整单结论。
+  --   decision='CONTINUE' 准予继续流转；decision='RECALL' 召回。
+  -- 记录只增不改：处置行本身永不 UPDATE/DELETE；同一出货单已有有效结论时再提交（哪怕携带旧版本）
+  --   一律拒绝，不会覆盖既有结论。此后批次过敏原 / 有效放行 / 所用卷停用信息变化时，
+  --   旧结论由 syncStaleDispositions 标记 life_status='STALE'（需重新评估，不自动生效），
+  --   原结论内容、依据、操作人原样保留；出货单原状态与数量占用不因处置而改变。
+  CREATE TABLE IF NOT EXISTS shipment_dispositions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- 不加外键/ON DELETE：处置记录只增不改，出货单本身也从不删除；
+    -- 批次连带删除等场景下处置记录与其历史结论必须原样保留。
+    shipment_id INTEGER NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN ('CONTINUE','RECALL')),
+    decided_by TEXT NOT NULL DEFAULT '',       -- 提交操作人
+    basis TEXT NOT NULL DEFAULT '',            -- 处置依据
+    expected_version INTEGER NOT NULL,         -- 查询时取得的状态版本（乐观并发）
+    context_hash TEXT NOT NULL DEFAULT '',     -- 提交当时的评估上下文指纹（变化即需重评）
+    context_snapshot TEXT NOT NULL DEFAULT '{}', -- 提交当时的上下文快照（用于生成需重评原因）
+    status_version INTEGER NOT NULL,           -- 提交后该单的状态版本
+    life_status TEXT NOT NULL DEFAULT 'ACTIVE'
+      CHECK (life_status IN ('ACTIVE','STALE')), -- 有效 / 需重新评估（结论不自动生效）
+    stale_reason TEXT NOT NULL DEFAULT '',
+    decided_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  -- 出货单状态版本：每次创建出货单 / 出货单转待评估 / 登记处置时 +1。
+  -- 质量处置接口要求提交查询时取得的版本，事务内与最新版本核对，过期拒绝且不产生记录。
+  CREATE TABLE IF NOT EXISTS shipment_versions (
+    -- 出货单从不删除；不加外键以便与只增不改的处置记录保持同一保留语义。
+    shipment_id INTEGER PRIMARY KEY,
+    version INTEGER NOT NULL DEFAULT 0
+  );
+
   CREATE INDEX IF NOT EXISTS idx_events_time ON events(event_time, id);
   CREATE INDEX IF NOT EXISTS idx_process_inputs_event ON process_inputs(event_id);
   CREATE INDEX IF NOT EXISTS idx_releases_batch ON releases(batch_id);
@@ -160,6 +193,7 @@ function initSchema(d) {
   CREATE INDEX IF NOT EXISTS idx_shipments_status ON shipments(status);
   CREATE INDEX IF NOT EXISTS idx_shipment_items_shipment ON shipment_items(shipment_id);
   CREATE INDEX IF NOT EXISTS idx_shipment_items_roll ON shipment_items(roll_id);
+  CREATE INDEX IF NOT EXISTS idx_ship_disp_shipment ON shipment_dispositions(shipment_id);
   `);
 }
 

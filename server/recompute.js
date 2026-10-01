@@ -202,7 +202,12 @@ function recompute(db) {
   const shipments = require('./shipments');
   const pendingShipments = shipments.syncPendingShipments(db);
 
-  return { invalidated, retiredRolls, pendingShipments };
+  // ---- 质量处置结论核对：批次过敏原 / 有效放行 / 所用卷停用信息变化后，
+  //      仍为 ACTIVE 的旧结论标为“需重新评估”（STALE，只增不改、不自动生效）----
+  const evaluation = require('./evaluation');
+  const staleDispositions = evaluation.syncStaleDispositions(db);
+
+  return { invalidated, retiredRolls, pendingShipments, staleDispositions };
 }
 
 module.exports = { recompute, sortedJson };

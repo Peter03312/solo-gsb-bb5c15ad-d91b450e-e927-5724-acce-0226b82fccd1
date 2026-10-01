@@ -210,6 +210,10 @@ function createShipment(db, body) {
     db.prepare('UPDATE shipments SET shipment_code = ? WHERE id = ?')
       .run(shipment_code, inserted.id);
 
+    // 出货单状态版本从 0 起步；转待评估、登记质量处置时各推进一次。
+    db.prepare('INSERT INTO shipment_versions (shipment_id, version) VALUES (?, 0)')
+      .run(inserted.id);
+
     const insItem = db.prepare(
       `INSERT INTO shipment_items
          (shipment_id, roll_id, roll_code, release_id, release_at, release_by,
@@ -265,6 +269,9 @@ function syncPendingShipments(db) {
     const reason = `出货所用标签卷已停用，相关已出货标签需质量评估：${parts.join('；')}`;
     const info = upd.run('PENDING_REVIEW', reason, shipment_id);
     if (info.changes) {
+      // 转待评估即推进状态版本：此前查询取得的版本立即过期，处置须按最新状态重新查询。
+      const { bumpVersion } = require('./evaluation');
+      bumpVersion(db, shipment_id);
       pending.push(formatShipment(
         db.prepare('SELECT * FROM shipments WHERE id = ?').get(shipment_id), db
       ));
@@ -325,6 +332,29 @@ function formatShipment(s, db) {
       qty: it.qty
     }))
     : [];
+  let currentDisposition = null;
+  let dispositionCount = 0;
+  if (db) {
+    const rows = db.prepare(
+      'SELECT * FROM shipment_dispositions WHERE shipment_id = ? ORDER BY id DESC'
+    ).all(s.id);
+    dispositionCount = rows.length;
+    if (rows.length) {
+      const d = rows[0];
+      currentDisposition = {
+        id: d.id,
+        decision: d.decision,
+        decision_text: d.decision === 'CONTINUE' ? '准予继续流转' : '召回',
+        decided_by: d.decided_by,
+        basis: d.basis,
+        life_status: d.life_status,
+        active: d.life_status === 'ACTIVE',
+        needs_review: d.life_status === 'STALE',
+        stale_reason: d.stale_reason || '',
+        decided_at: d.decided_at
+      };
+    }
+  }
   return {
     id: s.id,
     shipment_code: s.shipment_code,
@@ -339,6 +369,8 @@ function formatShipment(s, db) {
     shipped_at: s.shipped_at,
     shipped_by: s.shipped_by,
     created_at: s.created_at,
+    current_disposition: currentDisposition,
+    disposition_count: dispositionCount,
     items
   };
 }

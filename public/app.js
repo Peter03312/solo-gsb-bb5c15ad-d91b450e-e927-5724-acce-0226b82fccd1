@@ -266,17 +266,32 @@ function renderShipments() {
     $('#shipmentList').innerHTML = '<div class="batch-meta">尚无出货单。</div>';
     return;
   }
-  $('#shipmentList').innerHTML = list.map((s) => `
+  $('#shipmentList').innerHTML = list.map((s) => {
+    const cd = s.current_disposition;
+    let dispBadge = '';
+    if (cd) {
+      if (cd.needs_review) {
+        dispBadge = `<span class="badge disp-stale" title="${esc(cd.stale_reason)}">结论需重新评估：${esc(cd.decision_text)}</span>`;
+      } else {
+        dispBadge = `<span class="badge ${cd.decision === 'CONTINUE' ? 'disp-continue' : 'disp-recall'}">${esc(cd.decision_text)}</span>`;
+      }
+    }
+    return `
     <div class="shipment-card ${s.status === 'PENDING_REVIEW' ? 'pending' : ''}">
       <div class="shipment-head">
         <span class="shipment-code">${esc(s.shipment_code)}</span>
         <span class="badge ${s.status === 'SHIPPED' ? 'active' : 'invalid'}">
           ${s.status === 'SHIPPED' ? '已出货' : '待评估'}
         </span>
+        ${dispBadge}
         <span class="batch-meta">批次 ${esc(s.batch_code || '（已删除）')} ·
           ${esc(fmtTime(s.shipped_at))} · ${esc(s.shipped_by)}</span>
         <span class="spacer"></span>
         <span class="batch-meta">出货量 <b>${s.ship_qty}</b> 张</span>
+        ${s.status === 'PENDING_REVIEW'
+          ? `<button class="btn small primary" onclick="openEvaluation('${esc(s.shipment_code)}')">
+               ${cd ? '查看评估 / 历史' : '质量评估处置'}</button>`
+          : ''}
       </div>
       <div class="tag-row" style="margin:6px 0">
         <b class="batch-meta">出货时过敏原：</b>${allergenTags(s.allergens, '无过敏原')}
@@ -300,7 +315,14 @@ function renderShipments() {
       ${s.status === 'PENDING_REVIEW'
         ? `<div class="shipment-review-reason">⚠ 待评估原因：${esc(s.review_reason || '—')}</div>`
         : ''}
-    </div>`).join('');
+      ${cd ? `
+      <div class="disp-current ${cd.needs_review ? 'stale' : ''}">
+        <b>当前质量结论：${esc(cd.decision_text)}</b>
+        <span class="batch-meta">${esc(fmtTime(cd.decided_at))} · ${esc(cd.decided_by)} · 依据：${esc(cd.basis)}</span>
+        ${cd.needs_review ? `<div class="disp-stale-reason">↻ 需重新评估：${esc(cd.stale_reason)}</div>` : ''}
+      </div>` : ''}
+    </div>`;
+  }).join('');
 }
 
 function renderEvents() {
@@ -559,6 +581,11 @@ window.deleteEquipment = async (id) => {
 };
 
 $$('[data-close]').forEach((b) => b.onclick = (e) => e.target.closest('.modal').classList.add('hidden'));
+// 弹窗内容为动态渲染（如质量处置），用事件委托保证任意 [data-close] 都可关闭。
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-close]');
+  if (btn) btn.closest('.modal').classList.add('hidden');
+});
 
 // ================= 放行 =================
 window.openRelease = function (batchId) {
@@ -768,6 +795,194 @@ $('#shipmentForm').onsubmit = async (e) => {
     notice('ok', `出货确认成功：单号 ${r.shipment_code}，状态「已出货」，共 ${r.ship_qty} 张`);
   } catch (err) { notice('error', err.error || '出货被拒绝（整单未占用数量）', err.details); }
 };
+
+// ================= 出货质量处置（整单） =================
+let evalContext = null; // 最近一次查询取得的评估视图（含签名状态版本）
+
+function conditionRow(ok, text) {
+  return `<li class="${ok ? 'cond-ok' : 'cond-bad'}">${ok ? '✓' : '✗'} ${esc(text)}</li>`;
+}
+
+window.openEvaluation = async function (codeOrId) {
+  try {
+    evalContext = await api(`/api/shipments/${encodeURIComponent(codeOrId)}/evaluation`);
+    renderEvaluation();
+    $('#evaluationModal').classList.remove('hidden');
+  } catch (err) {
+    notice('error', err.error || '加载评估视图失败', err.details);
+  }
+};
+
+function renderEvaluation() {
+  const ev = evalContext;
+  const s = ev.shipment;
+  const c = ev.conditions;
+  const cur = ev.current_state;
+  const curDisp = ev.current_disposition;
+  const blocked = !ev.review.reviewable || (curDisp && curDisp.active);
+
+  const rollRows = cur.used_rolls.map((r) => `
+    <tr>
+      <td>${esc(r.roll_code || ('#' + r.roll_id))}</td>
+      <td>${r.missing ? '<span class="tag danger">卷记录缺失</span>'
+        : (r.retired ? '<span class="tag danger">已停用</span>' : '<span class="tag ok">使用中</span>')}</td>
+      <td>${r.retired ? esc(r.retired_reason || '—') : '—'}</td>
+      <td>${r.release_id == null ? '—（已解除/删除）' : '#' + r.release_id}
+        ${r.release_exists ? (r.release_active ? '<span class="tag ok">有效</span>' : '<span class="tag danger">已失效</span>')
+          : '<span class="tag danger">已删除</span>'}</td>
+    </tr>`).join('');
+
+  const historyRows = ev.history.slice().reverse().map((d) => `
+    <tr class="${d.life_status === 'STALE' ? 'hist-stale' : ''}">
+      <td>#${d.id}</td>
+      <td>${d.decision === 'CONTINUE'
+        ? '<span class="tag ok">准予继续流转</span>'
+        : '<span class="tag warn">召回</span>'}</td>
+      <td>${esc(fmtTime(d.decided_at))}</td>
+      <td>${esc(d.decided_by)}</td>
+      <td>${esc(d.basis)}</td>
+      <td>${d.life_status === 'STALE'
+        ? `<span class="tag warn" title="${esc(d.stale_reason)}">需重新评估</span><div class="batch-meta">${esc(d.stale_reason)}</div>`
+        : '<span class="tag ok">有效</span>'}</td>
+    </tr>`).join('');
+
+  $('#evalContent').innerHTML = `
+    <div class="shipment-head">
+      <span class="shipment-code">${esc(s.shipment_code)}</span>
+      <span class="badge invalid">待评估</span>
+      <span class="batch-meta">批次 ${esc(s.batch_code || '（批次已删除）')} ·
+        ${esc(fmtTime(s.shipped_at))} · ${esc(s.shipped_by)} · 出货 ${s.ship_qty} 张</span>
+    </div>
+    <div class="shipment-review-reason">⚠ 待评估原因：${esc(ev.review.review_reason || '—')}</div>
+
+    <div class="eval-grid">
+      <div class="eval-col">
+        <h4>出货当时（快照，不变）</h4>
+        <div class="tag-row" style="margin:4px 0 8px">
+          <b class="batch-meta">过敏原：</b>${allergenTags(ev.shipment_snapshot.allergens, '无过敏原')}
+        </div>
+        <table class="grid item-table">
+          <thead><tr><th>卷号</th><th>张数</th><th>修订号</th><th>放行</th><th>放行快照过敏原</th></tr></thead>
+          <tbody>${ev.shipment_snapshot.items.map((it) => `
+            <tr><td>${esc(it.roll_code)}</td><td>${it.qty}</td><td>${it.roll_revision}</td>
+              <td>${it.release_id == null ? '—' : '#' + it.release_id + ' ' + esc(fmtTime(it.release_at)) + ' ' + esc(it.release_by)}</td>
+              <td>${allergenTags(it.allergens, '无')}</td></tr>`).join('')}
+          </tbody>
+        </table>
+      </div>
+      <div class="eval-col">
+        <h4>当前状态</h4>
+        <div class="batch-meta" style="margin:4px 0">
+          批次：${cur.batch_exists ? esc(cur.batch_code) : '<span class="tag danger">批次已不存在</span>'}
+        </div>
+        <div class="tag-row" style="margin:4px 0">
+          <b class="batch-meta">当前批次过敏原：</b>
+          ${cur.batch_exists ? allergenTags(cur.batch_allergens, '无过敏原') : '<span class="tag none">无法推导</span>'}
+        </div>
+        <div style="margin:6px 0">
+          <b class="batch-meta">当前有效放行（${cur.active_releases.length}）：</b>
+          ${cur.active_releases.length
+            ? cur.active_releases.map((r) =>
+              `<span class="tag ok">#${r.id} ${esc(fmtTime(r.released_at))} ${esc(r.released_by)}｜${esc(r.snapshot_allergens.join('、') || '无')}</span>`).join('')
+            : '<span class="tag danger">无有效放行</span>'}
+        </div>
+        <table class="grid item-table">
+          <thead><tr><th>所用卷</th><th>当前状态</th><th>停用原因</th><th>绑定放行</th></tr></thead>
+          <tbody>${rollRows}</tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="cond-box ${c.can_continue ? 'can' : 'cannot'}">
+      <b>${c.can_continue ? '满足“准予继续流转”条件' : '不满足“准予继续流转”，只能召回'}</b>
+      <ul class="cond-list">
+        ${conditionRow(c.batch_exists, '批次仍存在且可重新推导过敏原')}
+        ${conditionRow(c.has_active_release, '当前有有效放行记录')}
+        ${conditionRow(c.snapshot_covers_current,
+          '出货快照覆盖当前过敏原' + (c.uncovered_allergens.length
+            ? `（未覆盖：${c.uncovered_allergens.join('、')}）` : ''))}
+      </ul>
+    </div>
+
+    ${curDisp && curDisp.active ? `
+      <div class="disp-current">
+        <b>已有有效结论：${esc(curDisp.decision_text)}</b>
+        <span class="batch-meta">${esc(fmtTime(curDisp.decided_at))} · ${esc(curDisp.decided_by)} · 依据：${esc(curDisp.basis)}</span>
+        <div class="batch-meta">处置记录只增不改，不能重复提交覆盖；待该结论被标为“需重新评估”后才可再次登记。</div>
+      </div>` : `
+    <form id="dispositionForm" class="disp-form">
+      <input type="hidden" name="version" value="${esc(ev.version)}">
+      <div class="form-row align-top">
+        <label>处置结论 <span class="req">*</span></label>
+        <div class="decision-pick">
+          <label><input type="radio" name="decision" value="CONTINUE" ${c.can_continue ? '' : 'disabled'}>
+            <span>准予继续流转</span>${c.can_continue ? '' : '<small class="hint">（当前条件不满足，不可选）</small>'}</label>
+          <label><input type="radio" name="decision" value="RECALL" checked>
+            <span>召回</span></label>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>提交操作人 <span class="req">*</span></label>
+        <input type="text" name="decided_by" placeholder="姓名/工号" required>
+      </div>
+      <div class="form-row align-top">
+        <label>处置依据 <span class="req">*</span></label>
+        <textarea name="basis" rows="2" required placeholder="如：核实新增过敏原为误投料/现场复检结果/召回决定文件号…"></textarea>
+      </div>
+      <div class="form-row">
+        <label>处置时间</label>
+        <input type="datetime-local" name="decided_at">
+      </div>
+      <div class="batch-meta">
+        状态版本 <code>${ev.status_version}</code>（查询时取得，30 分钟内有效；提交事务内核对，过期将拒绝且不产生记录）
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn" data-close>关闭</button>
+        <button type="submit" class="btn primary">提交整单处置（事务校验，记录只增不改）</button>
+      </div>
+    </form>`}
+
+    <h4 style="margin-top:14px">处置历史（只增不改）</h4>
+    ${historyRows ? `
+    <table class="grid item-table">
+      <thead><tr><th>#</th><th>结论</th><th>时间</th><th>操作人</th><th>依据</th><th>生命周期</th></tr></thead>
+      <tbody>${historyRows}</tbody>
+    </table>` : '<div class="batch-meta">尚无处置记录。</div>'}
+    <div class="modal-actions">
+      <button type="button" class="btn" data-close>关闭</button>
+    </div>
+  `;
+}
+
+$('#evaluationModal').addEventListener('submit', async (e) => {
+  const form = e.target.closest('#dispositionForm');
+  if (!form) return;
+  e.preventDefault();
+  const decisionEl = form.querySelector('input[name=decision]:checked');
+  const body = {
+    decision: decisionEl ? decisionEl.value : 'RECALL',
+    decided_by: form.decided_by.value.trim(),
+    basis: form.basis.value.trim(),
+    decided_at: form.decided_at.value || undefined,
+    version: form.version.value
+  };
+  const code = evalContext && evalContext.shipment && evalContext.shipment.shipment_code;
+  try {
+    const r = await api(`/api/shipments/${encodeURIComponent(code)}/dispositions`,
+      { method: 'POST', body });
+    evalContext = r.evaluation;
+    renderEvaluation();
+    await refresh();
+    notice('ok', `处置已登记：${r.disposition.decision_text}（记录只增不改；出货单原状态与数量占用不变）`);
+  } catch (err) {
+    notice('error', err.error || '处置提交被拒绝（未产生记录）', err.details);
+    // 版本可能已过期或被并发改动：重新查询最新评估视图
+    if (['VERSION_EXPIRED', 'VERSION_INVALID', 'DISPOSITION_EXISTS'].includes(err.code)) {
+      try { evalContext = await api(`/api/shipments/${encodeURIComponent(code)}/evaluation`); renderEvaluation(); }
+      catch (_) { /* ignore */ }
+    }
+  }
+});
 
 // ================= 启动 =================
 refresh().catch((err) => notice('error', '加载状态失败', err.message || String(err)));

@@ -240,3 +240,35 @@ details summary { cursor: pointer; color: var(--primary); font-size: 12.5px; mar
 .alloc-roll { min-width: 110px; font-weight: 600; font-size: 13px; }
 .alloc-qty { width: 110px; padding: 5px 8px; border: 1px solid #cdd7e0; border-radius: 6px; }
 .notice.warn { background: #fbf1d6; border: 1px solid #e8d29a; color: #8a5d00; }
+
+/* ---------- 出货质量处置 ---------- */
+.badge.disp-continue { background: var(--ok-bg); color: var(--ok); border: 1px solid #b7dcc5; }
+.badge.disp-recall { background: var(--danger-bg); color: var(--danger); border: 1px solid #e3b3ac; }
+.badge.disp-stale { background: var(--warn-bg); color: var(--warn); border: 1px solid #e8d29a; }
+.disp-current {
+  margin-top: 8px; border-radius: 8px; padding: 7px 10px; display: flex; flex-direction: column; gap: 3px;
+  border: 1px solid #b7dcc5; background: var(--ok-bg);
+}
+.disp-current.stale { border-color: #e8d29a; background: var(--warn-bg); }
+.disp-stale-reason { color: var(--warn); font-size: 12.5px; font-weight: 600; }
+.eval-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 12px 0; }
+.eval-col h4 { margin: 0 0 6px; font-size: 13.5px; color: #2b3c50; }
+@media (max-width: 860px) { .eval-grid { grid-template-columns: 1fr; } }
+.cond-box { border-radius: 8px; padding: 9px 12px; margin: 10px 0; border: 1px solid var(--line); background: #fbfcfd; }
+.cond-box.can { border-color: #b7dcc5; background: var(--ok-bg); }
+.cond-box.cannot { border-color: #e8d29a; background: var(--warn-bg); }
+.cond-list { margin: 6px 0 0; padding-left: 18px; font-size: 12.5px; }
+.cond-list li { margin: 2px 0; }
+.cond-ok { color: var(--ok); list-style: none; margin-left: -16px; }
+.cond-bad { color: var(--danger); list-style: none; margin-left: -16px; font-weight: 600; }
+.disp-form { border-top: 1px dashed var(--line); padding-top: 12px; margin-top: 10px; }
+.disp-form textarea {
+  flex: 1; padding: 7px 10px; border: 1px solid #cdd7e0; border-radius: 6px;
+  font-size: 13px; font-family: inherit; resize: vertical;
+}
+.decision-pick { flex: 1; display: flex; gap: 18px; }
+.decision-pick label { display: flex; align-items: center; gap: 6px; width: auto; font-weight: normal; }
+tr.hist-stale { background: var(--warn-bg); }
+#evalContent code {
+  background: #eef2f5; border-radius: 4px; padding: 0 6px; font-size: 12px;
+}

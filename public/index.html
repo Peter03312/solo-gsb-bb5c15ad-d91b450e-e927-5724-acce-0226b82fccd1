@@ -64,6 +64,14 @@
       原料/事件变更或放行删除导致卷停用时，相关已出货单转为<b>待评估</b>（不自动恢复），
       该卷尚未分配的已贴张数也不得再出货。
     </p>
+    <p class="section-hint">
+      <b>待评估出货单的质量处置（整单）</b>：质检人员按整单登记
+      <b>准予继续流转（CONTINUE）</b>或<b>召回（RECALL）</b>，须提交操作人、依据与查询时取得的状态版本。
+      准予继续流转仅在<b>批次仍存在、当前有有效放行且出货快照覆盖当前过敏原</b>时允许，否则只能召回；
+      提交在事务内核对最新版本，过期拒绝且不产生记录。处置记录<b>只增不改</b>：
+      此后批次过敏原、有效放行或所用卷停用信息变化时，旧结论保留并标为<b>需重新评估</b>（不自动生效），
+      出货单原状态与数量占用始终不变。
+    </p>
     <h3 class="sub-head">批次可出货余额（未停用卷的「已贴用 − 累计已分配」）</h3>
     <div id="balanceList" class="balance-grid"></div>
     <h3 class="sub-head">出货单</h3>
@@ -282,6 +290,14 @@
         <button type="submit" class="btn primary">确认出货（整单校验，失败不占数量）</button>
       </div>
     </form>
+  </div>
+</div>
+
+<!-- ============ 出货质量处置弹窗 ============ -->
+<div id="evaluationModal" class="modal hidden">
+  <div class="modal-box wide">
+    <h3>待评估出货单 · 质量处置（整单）</h3>
+    <div id="evalContent"></div>
   </div>
 </div>
 

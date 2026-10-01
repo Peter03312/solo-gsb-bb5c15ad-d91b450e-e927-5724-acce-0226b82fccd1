@@ -264,7 +264,12 @@ const FINGERPRINT_SQL = [
   `SELECT id, shipment_code, batch_id, batch_code, ship_qty, allergen_set, status,
           review_reason, shipped_at, shipped_by FROM shipments ORDER BY id`,
   `SELECT id, shipment_id, roll_id, roll_code, release_id, release_at, release_by,
-          allergen_set, roll_revision, qty FROM shipment_items ORDER BY id`
+          allergen_set, roll_revision, qty FROM shipment_items ORDER BY id`,
+  // 质量处置记录与出货单状态版本同样纳入指纹：预演后登记处置会使旧预演版本过期。
+  `SELECT id, shipment_id, decision, decided_by, basis, expected_version, context_hash,
+          context_snapshot, status_version, life_status, stale_reason, decided_at
+     FROM shipment_dispositions ORDER BY id`,
+  `SELECT shipment_id, version FROM shipment_versions ORDER BY shipment_id`
 ];
 function stateFingerprint(db) {
   const h = crypto.createHash('sha256');
@@ -509,6 +514,8 @@ function openShadow(sourceDb) {
   copy('label_roll_usages', 'id,roll_id,used_at,applied_qty,void_qty,expected_revision,used_by');
   copy('shipments', 'id,shipment_code,batch_id,batch_code,ship_qty,allergen_set,status,review_reason,shipped_at,shipped_by,created_at');
   copy('shipment_items', 'id,shipment_id,roll_id,roll_code,release_id,release_at,release_by,allergen_set,roll_revision,qty');
+  copy('shipment_dispositions', 'id,shipment_id,decision,decided_by,basis,expected_version,context_hash,context_snapshot,status_version,life_status,stale_reason,decided_at,created_at');
+  copy('shipment_versions', 'shipment_id,version');
   shadow.pragma('foreign_keys = ON');
   return shadow;
 }
@@ -552,11 +559,33 @@ function simulate(db, changes) {
       .filter((r) => shippedRealIds.has(r.id))
       .map((r) => formatShipment(
         shadow.prepare('SELECT * FROM shipments WHERE id = ?').get(r.id), shadow));
+    // 影子库中“正式库原为 ACTIVE、应用后将转为 STALE”的质量处置结论（旧结论保留、需重新评估）。
+    const activeDispRealIds = new Set(db.prepare(
+      "SELECT id FROM shipment_dispositions WHERE life_status = 'ACTIVE'"
+    ).all().map((r) => r.id));
+    const staleDispositions = shadow.prepare(
+      `SELECT d.id AS disposition_id, d.shipment_id, s.shipment_code,
+              d.decision, d.stale_reason AS reason
+         FROM shipment_dispositions d
+         JOIN shipments s ON s.id = d.shipment_id
+        WHERE d.life_status = 'STALE' ORDER BY d.id`
+    ).all()
+      .filter((r) => activeDispRealIds.has(r.disposition_id))
+      .map((r) => ({
+        disposition_id: r.disposition_id,
+        shipment_id: r.shipment_id,
+        shipment_code: r.shipment_code,
+        decision: r.decision,
+        decision_text: r.decision === 'CONTINUE' ? '准予继续流转' : '召回',
+        reason: r.reason
+      }));
     const diff = diffSnapshots(before, after);
     diff.label_rolls_will_retire = retiredRolls;
     diff.summary.label_rolls_will_retire = retiredRolls.length;
     diff.shipments_will_pending = pendingShipments;
     diff.summary.shipments_will_pending = pendingShipments.length;
+    diff.dispositions_will_stale = staleDispositions;
+    diff.summary.dispositions_will_stale = staleDispositions.length;
     return { resolved, inserted, after, diff };
   } finally {
     shadow.close();
@@ -618,7 +647,7 @@ function apply(db, body) {
     if (errors.length) {
       throw new ReplanError('REPLAN_REJECTED', '整组变更应用后的时间线校验未通过', errors);
     }
-    const { invalidated, retiredRolls, pendingShipments } = recompute(db);
+    const { invalidated, retiredRolls, pendingShipments, staleDispositions } = recompute(db);
     const after = takeSnapshot(db);
     const appliedDiff = diffSnapshots(before, after);
     appliedDiff.label_rolls_will_retire = retiredRolls.map((r) => ({
@@ -629,6 +658,9 @@ function apply(db, body) {
     // pendingShipments 已是完整出货单（含原因与快照明细）。
     appliedDiff.shipments_will_pending = pendingShipments;
     appliedDiff.summary.shipments_will_pending = pendingShipments.length;
+    // 旧质量处置结论被标为需重新评估（只增不改，不自动生效）。
+    appliedDiff.dispositions_will_stale = staleDispositions;
+    appliedDiff.summary.dispositions_will_stale = staleDispositions.length;
 
     // 提交后再计算一次指纹，作为新的业务版本随结果返回。
     response = {
@@ -639,6 +671,7 @@ function apply(db, body) {
       invalidated,
       retired_rolls: retiredRolls,
       pending_shipments: pendingShipments,
+      stale_dispositions: staleDispositions,
       diff: appliedDiff
     };
   });
