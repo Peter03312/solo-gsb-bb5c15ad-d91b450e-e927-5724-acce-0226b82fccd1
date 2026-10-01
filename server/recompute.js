@@ -202,7 +202,11 @@ function recompute(db) {
   const shipments = require('./shipments');
   const pendingShipments = shipments.syncPendingShipments(db);
 
-  return { invalidated, retiredRolls, pendingShipments };
+  // ---- 处置结论需重新评估：批次过敏原/有效放行/卷停用变化后，旧 CURRENT 结论置 NEEDS_REVIEW ----
+  const reviews = require('./reviews');
+  const staleReviews = reviews.syncStaleReviews(db);
+
+  return { invalidated, retiredRolls, pendingShipments, staleReviews };
 }
 
 module.exports = { recompute, sortedJson };

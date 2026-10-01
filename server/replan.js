@@ -264,7 +264,12 @@ const FINGERPRINT_SQL = [
   `SELECT id, shipment_code, batch_id, batch_code, ship_qty, allergen_set, status,
           review_reason, shipped_at, shipped_by FROM shipments ORDER BY id`,
   `SELECT id, shipment_id, roll_id, roll_code, release_id, release_at, release_by,
-          allergen_set, roll_revision, qty FROM shipment_items ORDER BY id`
+          allergen_set, roll_revision, qty FROM shipment_items ORDER BY id`,
+  // 处置记录是出货单查询版本（依据指纹）的并发保护对象：预演后提交处置会改变正式状态，
+  // 纳入指纹可使旧预演版本过期。
+  `SELECT id, shipment_id, decision, decided_by, basis, decided_at, status, stale_reason,
+          basis_version, basis_fingerprint, evidence_json, version_nonce
+     FROM shipment_reviews ORDER BY id`
 ];
 function stateFingerprint(db) {
   const h = crypto.createHash('sha256');
@@ -509,6 +514,7 @@ function openShadow(sourceDb) {
   copy('label_roll_usages', 'id,roll_id,used_at,applied_qty,void_qty,expected_revision,used_by');
   copy('shipments', 'id,shipment_code,batch_id,batch_code,ship_qty,allergen_set,status,review_reason,shipped_at,shipped_by,created_at');
   copy('shipment_items', 'id,shipment_id,roll_id,roll_code,release_id,release_at,release_by,allergen_set,roll_revision,qty');
+  copy('shipment_reviews', 'id,shipment_id,decision,decided_by,basis,decided_at,status,stale_reason,basis_version,basis_fingerprint,evidence_json,version_nonce,created_at');
   shadow.pragma('foreign_keys = ON');
   return shadow;
 }
@@ -552,11 +558,30 @@ function simulate(db, changes) {
       .filter((r) => shippedRealIds.has(r.id))
       .map((r) => formatShipment(
         shadow.prepare('SELECT * FROM shipments WHERE id = ?').get(r.id), shadow));
+    // 影子库中“重算后将新转入 NEEDS_REVIEW”的处置结论（正式库原为 CURRENT）
+    const currentReviewIds = new Set(db.prepare(
+      "SELECT id FROM shipment_reviews WHERE status = 'CURRENT'"
+    ).all().map((r) => r.id));
+    const staleReviews = shadow.prepare(
+      `SELECT sr.id AS review_id, sr.shipment_id, s.shipment_code, sr.decision, sr.stale_reason
+         FROM shipment_reviews sr
+         JOIN shipments s ON s.id = sr.shipment_id
+        WHERE sr.status = 'NEEDS_REVIEW' ORDER BY sr.id`
+    ).all()
+      .filter((r) => currentReviewIds.has(r.review_id))
+      .map((r) => ({
+        review_id: r.review_id, shipment_id: r.shipment_id, shipment_code: r.shipment_code,
+        old_decision: r.decision,
+        old_decision_text: r.decision === 'CONTINUE' ? '准予继续流转' : '召回',
+        reason: r.stale_reason
+      }));
     const diff = diffSnapshots(before, after);
     diff.label_rolls_will_retire = retiredRolls;
     diff.summary.label_rolls_will_retire = retiredRolls.length;
     diff.shipments_will_pending = pendingShipments;
     diff.summary.shipments_will_pending = pendingShipments.length;
+    diff.reviews_need_reevaluate = staleReviews;
+    diff.summary.reviews_need_reevaluate = staleReviews.length;
     return { resolved, inserted, after, diff };
   } finally {
     shadow.close();
@@ -618,7 +643,7 @@ function apply(db, body) {
     if (errors.length) {
       throw new ReplanError('REPLAN_REJECTED', '整组变更应用后的时间线校验未通过', errors);
     }
-    const { invalidated, retiredRolls, pendingShipments } = recompute(db);
+    const { invalidated, retiredRolls, pendingShipments, staleReviews } = recompute(db);
     const after = takeSnapshot(db);
     const appliedDiff = diffSnapshots(before, after);
     appliedDiff.label_rolls_will_retire = retiredRolls.map((r) => ({
@@ -629,6 +654,8 @@ function apply(db, body) {
     // pendingShipments 已是完整出货单（含原因与快照明细）。
     appliedDiff.shipments_will_pending = pendingShipments;
     appliedDiff.summary.shipments_will_pending = pendingShipments.length;
+    appliedDiff.reviews_need_reevaluate = staleReviews;
+    appliedDiff.summary.reviews_need_reevaluate = staleReviews.length;
 
     // 提交后再计算一次指纹，作为新的业务版本随结果返回。
     response = {
@@ -639,6 +666,7 @@ function apply(db, body) {
       invalidated,
       retired_rolls: retiredRolls,
       pending_shipments: pendingShipments,
+      stale_reviews: staleReviews,
       diff: appliedDiff
     };
   });

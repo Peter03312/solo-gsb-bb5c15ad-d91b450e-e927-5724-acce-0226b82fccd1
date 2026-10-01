@@ -240,3 +240,33 @@ details summary { cursor: pointer; color: var(--primary); font-size: 12.5px; mar
 .alloc-roll { min-width: 110px; font-weight: 600; font-size: 13px; }
 .alloc-qty { width: 110px; padding: 5px 8px; border: 1px solid #cdd7e0; border-radius: 6px; }
 .notice.warn { background: #fbf1d6; border: 1px solid #e8d29a; color: #8a5d00; }
+
+/* ---- 出货质量处置 ---- */
+.review-current {
+  margin-top: 8px; padding: 8px 12px; border-radius: 8px;
+  border: 1px solid var(--line); background: #fbfcfd;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.review-current.continue { border-color: #a9d8bb; background: var(--ok-bg); }
+.review-current.recall { border-color: #e3b3ac; background: var(--danger-bg); }
+.review-stale {
+  margin-top: 8px; padding: 8px 12px; border-radius: 8px;
+  border: 1px solid #ecd3a4; background: var(--warn-bg); color: var(--warn);
+  font-size: 13px;
+}
+.review-items, .review-releases, .review-rolls, .review-blockers { width: 100%; }
+.review-blocker-list { margin: 4px 0 0 18px; color: var(--danger); font-size: 13px; }
+.review-decision { display: flex; gap: 18px; }
+.review-decision label { display: inline-flex; align-items: center; gap: 6px; }
+.review-history {
+  width: 100%; display: flex; flex-direction: column; gap: 6px;
+}
+.review-history-item {
+  border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px;
+  background: #fbfcfd; font-size: 12.5px;
+}
+.review-history-item.continue { border-color: #a9d8bb; background: var(--ok-bg); }
+.review-history-item.recall { border-color: #e3b3ac; background: var(--danger-bg); }
+.review-history-item.stale { border-color: #ecd3a4; background: var(--warn-bg); }
+.review-history-item.old { opacity: .75; }
+textarea { width: 100%; font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; }

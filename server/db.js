@@ -151,6 +151,27 @@ function initSchema(d) {
     qty INTEGER NOT NULL CHECK (qty > 0)      -- 本卷分配张数（正整数）
   );
 
+  -- 出货质量处置（仅对已转“待评估”的出货单按整单登记）：准予继续流转 / 召回。
+  -- 记录只增不改：新结论插入后旧结论置 SUPERSEDED（被更新的结论取代，留痕保留）；
+  -- 当批次过敏原、有效放行或所用卷停用信息随后变化时，旧的 CURRENT 结论置 NEEDS_REVIEW
+  -- （需重新评估，不自动生效、不自动恢复），需重新提交新结论。
+  CREATE TABLE IF NOT EXISTS shipment_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shipment_id INTEGER NOT NULL REFERENCES shipments(id),
+    decision TEXT NOT NULL CHECK (decision IN ('CONTINUE','RECALL')), -- 准予继续流转 / 召回
+    decided_by TEXT NOT NULL DEFAULT '',      -- 操作人
+    basis TEXT NOT NULL DEFAULT '',           -- 依据
+    decided_at TEXT NOT NULL,                 -- 处置时间
+    status TEXT NOT NULL DEFAULT 'CURRENT'
+      CHECK (status IN ('CURRENT','SUPERSEDED','NEEDS_REVIEW')),
+    stale_reason TEXT NOT NULL DEFAULT '',    -- NEEDS_REVIEW 原因（留痕）
+    basis_version TEXT NOT NULL,              -- 查询时取得的状态版本（依据指纹 HMAC 令牌）
+    basis_fingerprint TEXT NOT NULL,          -- 提交时核对的依据指纹（hex）
+    evidence_json TEXT NOT NULL DEFAULT '{}', -- 提交当时的依据快照（当前过敏原/有效放行/卷停用）
+    version_nonce TEXT NOT NULL DEFAULT '',   -- 版本令牌载荷签名（重放检测：同令牌不得重复落记录）
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
   CREATE INDEX IF NOT EXISTS idx_events_time ON events(event_time, id);
   CREATE INDEX IF NOT EXISTS idx_process_inputs_event ON process_inputs(event_id);
   CREATE INDEX IF NOT EXISTS idx_releases_batch ON releases(batch_id);
@@ -160,6 +181,8 @@ function initSchema(d) {
   CREATE INDEX IF NOT EXISTS idx_shipments_status ON shipments(status);
   CREATE INDEX IF NOT EXISTS idx_shipment_items_shipment ON shipment_items(shipment_id);
   CREATE INDEX IF NOT EXISTS idx_shipment_items_roll ON shipment_items(roll_id);
+  CREATE INDEX IF NOT EXISTS idx_shipment_reviews_shipment ON shipment_reviews(shipment_id, id);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_shipment_reviews_nonce ON shipment_reviews(shipment_id, version_nonce);
   `);
 }
 

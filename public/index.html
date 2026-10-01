@@ -285,6 +285,67 @@
   </div>
 </div>
 
+<!-- ============ 出货质量处置弹窗 ============ -->
+<div id="reviewModal" class="modal hidden">
+  <div class="modal-box wide">
+    <h3 id="reviewModalTitle">出货质量处置（待评估单据）</h3>
+    <form id="reviewForm">
+      <input type="hidden" name="version">
+      <div class="form-row align-top">
+        <label>出货快照过敏原</label>
+        <div id="reviewShipAllergens" class="tag-row"></div>
+      </div>
+      <div class="form-row align-top">
+        <label>逐卷分配 / 放行快照</label>
+        <div id="reviewItems" class="review-items"></div>
+      </div>
+      <div class="form-row align-top">
+        <label>当前批次过敏原</label>
+        <div id="reviewCurrentAllergens" class="tag-row"></div>
+      </div>
+      <div class="form-row align-top">
+        <label>当前有效放行</label>
+        <div id="reviewReleases" class="review-releases"></div>
+      </div>
+      <div class="form-row align-top">
+        <label>所用卷停用情况</label>
+        <div id="reviewRolls" class="review-rolls"></div>
+      </div>
+      <div class="form-row align-top" id="reviewBlockerRow">
+        <label>继续流转条件</label>
+        <div id="reviewBlockers" class="review-blockers"></div>
+      </div>
+      <div class="form-row align-top">
+        <label>处置结论 <span class="req">*</span></label>
+        <div id="reviewDecision" class="review-decision">
+          <label><input type="radio" name="decision" value="CONTINUE"> 准予继续流转</label>
+          <label><input type="radio" name="decision" value="RECALL" checked> 召回</label>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>操作人 <span class="req">*</span></label>
+        <input type="text" name="decided_by" placeholder="姓名/工号" required>
+      </div>
+      <div class="form-row align-top">
+        <label>依据 <span class="req">*</span></label>
+        <textarea name="basis" rows="3" required placeholder="如：经核对批次过敏原未变化、放行有效、出货快照覆盖当前集合，准予继续流转"></textarea>
+      </div>
+      <div class="form-row">
+        <label>处置时间</label>
+        <input type="datetime-local" name="decided_at">
+      </div>
+      <div class="form-row align-top" id="reviewHistoryRow">
+        <label>历史结论（只增不改）</label>
+        <div id="reviewHistory" class="review-history"></div>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn" data-close>取消</button>
+        <button type="submit" class="btn primary">提交处置（事务内核版本与条件）</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 <script src="app.js"></script>
 </body>
 </html>

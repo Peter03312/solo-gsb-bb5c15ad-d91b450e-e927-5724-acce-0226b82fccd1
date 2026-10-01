@@ -68,6 +68,13 @@ function reportPendingShipments(list) {
   }
 }
 
+function reportStaleReviews(list) {
+  if (Array.isArray(list) && list.length) {
+    notice('warn', `${list.length} 条旧处置结论需重新评估（保留留痕，不自动生效）`,
+      list.map((r) => `${r.shipment_code || ('出货单#' + r.shipment_id)}：原「${r.old_decision_text}」${r.reason ? '：' + r.reason : ''}`));
+  }
+}
+
 // ================= 渲染 =================
 async function refresh() {
   state = await api('/api/state');
@@ -273,10 +280,14 @@ function renderShipments() {
         <span class="badge ${s.status === 'SHIPPED' ? 'active' : 'invalid'}">
           ${s.status === 'SHIPPED' ? '已出货' : '待评估'}
         </span>
+        ${renderReviewBadge(s.review)}
         <span class="batch-meta">批次 ${esc(s.batch_code || '（已删除）')} ·
           ${esc(fmtTime(s.shipped_at))} · ${esc(s.shipped_by)}</span>
         <span class="spacer"></span>
         <span class="batch-meta">出货量 <b>${s.ship_qty}</b> 张</span>
+        ${s.status === 'PENDING_REVIEW'
+          ? `<button class="btn small primary" onclick="openReview('${esc(s.shipment_code)}')">质量处置</button>`
+          : ''}
       </div>
       <div class="tag-row" style="margin:6px 0">
         <b class="batch-meta">出货时过敏原：</b>${allergenTags(s.allergens, '无过敏原')}
@@ -300,7 +311,35 @@ function renderShipments() {
       ${s.status === 'PENDING_REVIEW'
         ? `<div class="shipment-review-reason">⚠ 待评估原因：${esc(s.review_reason || '—')}</div>`
         : ''}
+      ${renderReviewSummary(s.review)}
     </div>`).join('');
+}
+
+function renderReviewBadge(review) {
+  if (!review) {
+    return '<span class="tag none">未处置</span>';
+  }
+  if (review.needs_review) return '<span class="badge invalid">旧结论需重新评估</span>';
+  if (review.superseded) return '<span class="tag none">历史结论</span>';
+  return review.decision === 'CONTINUE'
+    ? '<span class="badge active">已准予继续流转</span>'
+    : '<span class="badge invalid">已召回</span>';
+}
+
+function renderReviewSummary(review) {
+  if (!review) return '';
+  if (review.needs_review) {
+    return `<div class="review-stale">
+      ⟳ 旧处置结论「${esc(review.decision_text)}」所依据的批次过敏原 / 有效放行 / 卷停用信息已变化，
+      需重新评估、<b>不自动生效</b>。${review.stale_reason ? `<div class="batch-meta">${esc(review.stale_reason)}</div>` : ''}
+    </div>`;
+  }
+  if (review.superseded) return ''; // 被取代的结论只在历史里展示
+  return `<div class="review-current ${review.decision === 'CONTINUE' ? 'continue' : 'recall'}">
+    <b>当前处置：${esc(review.decision_text)}</b>
+    <span class="batch-meta">${esc(fmtTime(review.decided_at))} · ${esc(review.decided_by)}</span>
+    <div class="batch-meta">依据：${esc(review.basis)}</div>
+  </div>`;
 }
 
 function renderEvents() {
@@ -469,6 +508,7 @@ $('#eventForm').onsubmit = async (e) => {
     if (r.invalidated && r.invalidated.length) reportInvalidated(r.invalidated);
     if (r.retired_rolls && r.retired_rolls.length) reportRetiredRolls(r.retired_rolls);
     if (r.pending_shipments && r.pending_shipments.length) reportPendingShipments(r.pending_shipments);
+    if (r.stale_reviews && r.stale_reviews.length) reportStaleReviews(r.stale_reviews);
   } catch (err) {
     notice('error', err.error || '提交失败', err.details);
   }
@@ -483,6 +523,7 @@ window.deleteEvent = async function (id) {
     reportInvalidated(r.invalidated);
     reportRetiredRolls(r.retired_rolls);
     reportPendingShipments(r.pending_shipments);
+    reportStaleReviews(r.stale_reviews);
   } catch (err) { notice('error', err.error || '删除失败', err.details); }
 };
 
@@ -515,6 +556,7 @@ $('#materialForm').onsubmit = async (e) => {
       reportInvalidated(r.invalidated);
       reportRetiredRolls(r.retired_rolls);
       reportPendingShipments(r.pending_shipments);
+      reportStaleReviews(r.stale_reviews);
     } else {
       await api('/api/materials', { method: 'POST', body });
       await refresh();
@@ -597,6 +639,7 @@ window.deleteRelease = async (id) => {
     notice('ok', '放行记录已删除');
     reportRetiredRolls(r.retired_rolls);
     reportPendingShipments(r.pending_shipments);
+    reportStaleReviews(r.stale_reviews);
   } catch (err) { notice('error', err.error || '删除失败', err.details); }
 };
 
@@ -767,6 +810,110 @@ $('#shipmentForm').onsubmit = async (e) => {
     await refresh();
     notice('ok', `出货确认成功：单号 ${r.shipment_code}，状态「已出货」，共 ${r.ship_qty} 张`);
   } catch (err) { notice('error', err.error || '出货被拒绝（整单未占用数量）', err.details); }
+};
+
+// ================= 出货质量处置（待评估：准予继续流转 / 召回） =================
+let reviewContextCache = null;
+
+window.openReview = async function (code) {
+  try {
+    const ctx = await api(`/api/shipments/${encodeURIComponent(code)}/review`);
+    reviewContextCache = ctx;
+    const f = $('#reviewForm');
+    f.reset();
+    f.version.value = ctx.version;
+    f.decided_at.value = new Date().toISOString().slice(0, 16);
+    $('#reviewModalTitle').textContent = `质量处置 · ${ctx.shipment_code}`;
+    renderReviewContext(ctx);
+    $('#reviewModal').classList.remove('hidden');
+  } catch (err) { notice('error', err.error || '加载处置上下文失败', err.details); }
+};
+
+function renderReviewContext(ctx) {
+  const ev = ctx.evidence || {};
+  $('#reviewShipAllergens').innerHTML = allergenTags(ctx.shipment.allergen_set, '无过敏原');
+  $('#reviewItems').innerHTML = `
+    <table class="grid item-table">
+      <thead><tr><th>卷号</th><th>分配</th><th>修订号</th><th>放行标识</th><th>放行时间/人</th><th>快照集合</th></tr></thead>
+      <tbody>
+        ${ctx.shipment.items.map((it) => `
+          <tr>
+            <td>${esc(it.roll_code)}</td><td>${it.qty}</td><td>${it.roll_revision}</td>
+            <td>#${it.release_id == null ? '（已删除）' : it.release_id}</td>
+            <td>${esc(fmtTime(it.release_at))} · ${esc(it.release_by)}</td>
+            <td>${allergenTags(it.allergens, '无')}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+  $('#reviewCurrentAllergens').innerHTML = ev.batch
+    ? allergenTags(ev.batch.allergens, '无过敏原')
+    : '<span class="tag danger">批次加工记录已不存在</span>';
+  $('#reviewReleases').innerHTML = ev.active_releases && ev.active_releases.length
+    ? ev.active_releases.map((r) =>
+      `<span class="mini-roll active">#${r.id} ${esc(fmtTime(r.released_at))} · ${esc(r.released_by)}｜${allergenTags(r.allergens, '无')}</span>`
+    ).join(' ')
+    : '<span class="tag danger">当前无有效放行</span>';
+  $('#reviewRolls').innerHTML = (ev.rolls || []).map((r) =>
+    r.retired
+      ? `<span class="mini-roll off">${esc(r.roll_code)}：已停用（${esc(r.retired_reason || '见停用原因')}）</span>`
+      : `<span class="mini-roll">${esc(r.roll_code)}：未停用（${esc(r.status || '?')}）</span>`
+  ).join(' ');
+  $('#reviewBlockerRow').style.display = ctx.can_continue ? 'none' : 'block';
+  $('#reviewBlockers').innerHTML = ctx.can_continue
+    ? '<span class="tag">条件满足：批次存在、有有效放行、出货快照覆盖当前过敏原，可准予继续流转或召回</span>'
+    : `<ul class="review-blocker-list">${ctx.continue_blockers.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>
+       <small class="hint">只能选择“召回”。</small>`;
+  const continueRadio = $('#reviewDecision input[value="CONTINUE"]');
+  continueRadio.disabled = !ctx.can_continue;
+  if (!ctx.can_continue) $('#reviewDecision input[value="RECALL"]').checked = true;
+  else $('#reviewDecision input[value="CONTINUE"]').checked = true;
+  renderReviewHistory(ctx.review_history || []);
+}
+
+function renderReviewHistory(history) {
+  if (!history.length) {
+    $('#reviewHistory').innerHTML = '<div class="batch-meta">尚无处置结论（本次为首轮登记）。</div>';
+    return;
+  }
+  $('#reviewHistory').innerHTML = history.map((r) => {
+    const cls = r.status === 'CURRENT'
+      ? (r.decision === 'CONTINUE' ? 'continue' : 'recall')
+      : r.status === 'NEEDS_REVIEW' ? 'stale' : 'old';
+    return `<div class="review-history-item ${cls}">
+      <b>${esc(r.status_text)} · ${esc(r.decision_text)}</b>
+      <span class="batch-meta">${esc(fmtTime(r.decided_at))} · ${esc(r.decided_by)} · 依据版本 ${esc(r.basis_version_business)}</span>
+      <div class="batch-meta">依据：${esc(r.basis)}</div>
+      ${r.stale_reason ? `<div class="batch-meta">变化：${esc(r.stale_reason)}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+$('#reviewForm').onsubmit = async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  const body = {
+    version: f.version.value,
+    decision: (new FormData(f)).get('decision'),
+    decided_by: f.decided_by.value,
+    basis: f.basis.value,
+    decided_at: f.decided_at.value || undefined
+  };
+  const code = reviewContextCache ? reviewContextCache.shipment_code : '';
+  try {
+    await api(`/api/shipments/${encodeURIComponent(code)}/reviews`, { method: 'POST', body });
+    $('#reviewModal').classList.add('hidden');
+    await refresh();
+    notice('ok', `处置结论已登记：${body.decision === 'CONTINUE' ? '准予继续流转' : '召回'}（记录只增不改）`);
+  } catch (err) {
+    notice('error', err.error || '处置提交被拒绝（未产生记录）', err.details);
+    // 版本可能已过期：重新拉取最新上下文，避免继续用旧版本
+    try {
+      const ctx = await api(`/api/shipments/${encodeURIComponent(code)}/review`);
+      reviewContextCache = ctx;
+      f.version.value = ctx.version;
+      renderReviewContext(ctx);
+    } catch (_) { /* 保留弹窗 */ }
+  }
 };
 
 // ================= 启动 =================

@@ -339,6 +339,8 @@ function formatShipment(s, db) {
     shipped_at: s.shipped_at,
     shipped_by: s.shipped_by,
     created_at: s.created_at,
+    // 当前质量处置结论（最新一条；NEEDS_REVIEW 表示旧结论需重新评估、不自动生效）。
+    review: db ? require('./reviews').getLatestReview(db, s.id) : null,
     items
   };
 }

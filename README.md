@@ -3,7 +3,9 @@
 本地运行的食品加工过敏原追溯网页：录入**原料过敏原、设备、按时间排序的加工事件与已核实清洗事件**，
 系统按时间顺序推导每个产出批次的过敏原集合及来源路径，管理设备残留，支持按**当时推导结果**登记批次放行，
 并在**包装前按批次 + 有效放行登记过敏原标签卷**（按修订号核销贴用/作废，集合或放行变化时永久停用），
-**包装出货时按批次把已贴用标签卷分配给出货单**（整单事务校验，卷停用时相关已出货单转待评估、不自动恢复）。
+**包装出货时按批次把已贴用标签卷分配给出货单**（整单事务校验，卷停用时相关已出货单转待评估、不自动恢复），
+并对**待评估出货单按整单登记质量处置**（准予继续流转 / 召回，凭查询时取得的状态版本乐观并发；
+依据变化后旧结论标记需重新评估、不自动生效，结论记录只增不改）。
 
 - 后端：Node.js + Express
 - 数据库：SQLite（[better-sqlite3](https://github.com/WiseLibs/better-sqlite3)，数据文件本地保存）
@@ -345,6 +347,145 @@ curl -s http://localhost:3000/api/shipments/SHIP-0001
 | 出货单不存在（按 id / 单号查询） | 404 | `SHIPMENT_NOT_FOUND` |
 | 列表 `status` 取值非法 | 400 | `INVALID_REQUEST` |
 
+## 出货质量处置（待评估单据：准予继续流转 / 召回）
+
+对已转为**待评估（PENDING_REVIEW）**的出货单，质检人员按**整单**登记处置结论（一单同时只能有一个当前结论）：
+
+- 处置二选一：**准予继续流转（CONTINUE）** 或 **召回（RECALL）**，提交**操作人、依据**与**查询时取得的状态版本**。
+- 查询（处置上下文）呈现：
+  - **出货时**的过敏原集合、**逐卷分配明细与放行快照**（卷号 / 分配张数 / 修订号 / 放行标识 / 放行时间与操作人）；
+  - **当前**批次过敏原、该批次**当前全部有效放行**、出货**所用各卷当前停用状态与停用原因**；
+  - 以及当前**是否满足继续流转条件、允许的处置项**和状态版本（含 12 位业务版本短码）。
+- **准予继续流转仅在三个条件同时成立时允许**：
+  1. **批次仍存在**（加工记录仍在，可重新推导过敏原）；
+  2. 当前**存在有效放行**（该批次至少一条 `ACTIVE` 放行）；
+  3. **出货快照覆盖当前过敏原**：当前批次过敏原集合 ⊆ 出货时快照集合（出货后新增的过敏原不能“被旧标签覆盖”）。
+  任一不满足时，只能选择**召回**；强行提交 CONTINUE 返回 `409 CONTINUE_NOT_ALLOWED` 且不产生记录。
+- **乐观并发（状态版本）**：提交必须携带 `GET …/review` 返回的 `version`（HMAC 签名令牌，30 分钟有效，
+  服务重启后旧版本作废）。服务在**一次事务内**重新读取最新依据并核对单据状态、依据指纹与处置条件：
+  - 版本签名/格式非法 → `400 VERSION_INVALID`；版本超过 30 分钟 → `409 VERSION_EXPIRED`；
+  - 查询后批次过敏原、有效放行或所用卷停用信息发生变化 → `409 VERSION_EXPIRED`，**拒绝且不产生记录**，需重新查询；
+  - **同一版本重复提交**（或已有基于相同依据的更新结论）→ `409 VERSION_USED` / `409 VERSION_EXPIRED`，
+    **重复用旧版本不得覆盖新结论**。
+- **记录只增不改（append-only）**：新结论插入后，原“当前结论”置为 `SUPERSEDED`（历史保留），
+  任何既有记录的内容（处置/操作人/依据/版本/依据快照）都不会被改写；页面与接口可查**当前结论与完整历史**。
+- **需重新评估（不自动生效）**：此后**批次过敏原、有效放行或所用卷停用信息变化**时
+  （事件/原料更正、整组换线确认应用、放行登记或删除等），该单仍为当前的旧结论（无论 CONTINUE 还是 RECALL）
+  自动置为 `NEEDS_REVIEW` 并记录具体变化原因；**旧结论保留但不自动生效**，需重新查询后提交新结论。
+- **原规则全部保持**：出货单状态不因处置自动恢复（始终停留在待评估，等待线下流程）、
+  已分配**数量占用**不退回、标签卷**停卷规则**不变（停用卷余量恒为 0）。
+- 整组换线预演的 `diff.reviews_need_reevaluate`（与 `summary.reviews_need_reevaluate`）列出应用后**将需重新评估的结论**；
+  确认应用响应与各写入接口另附 `stale_reviews`（本次新转入需重新评估的结论）。
+
+### HTTP API
+
+| 方法与路径 | 说明 |
+| --- | --- |
+| `GET /api/shipments/:idOrCode/review` | 处置上下文：出货快照 + 逐卷/放行快照、当前批次过敏原/有效放行/卷停用原因、`can_continue`/`allowed_decisions`、状态版本 `version` |
+| `POST /api/shipments/:idOrCode/reviews` | 提交处置（事务内核版本与条件），返回最新出货单（含 `review` 当前结论） |
+| `GET /api/shipments/:idOrCode/reviews` | 该单完整处置历史（新到旧；`CURRENT` / `SUPERSEDED` / `NEEDS_REVIEW`） |
+| `GET /api/shipments/:idOrCode`、`GET /api/shipments`、`GET /api/state` | 响应中每张出货单另含 `review`：当前结论（无则 `null`），字段含 `decision` / `status` / `needs_review` / `stale_reason` 等 |
+| 事件/原料写入、放行 `POST/DELETE`、换线 `apply` | 响应另附 `stale_reviews`（本次被标“需重新评估”的旧结论） |
+| 换线 `preview` 的 `diff` | 另含 `reviews_need_reevaluate` 与 `summary.reviews_need_reevaluate` |
+
+提交请求体（`version` 取自查询响应；`decision` 也接受中文“准予继续流转”/“召回”）：
+
+```json
+{ "version": "<GET /review 返回的状态版本>",
+  "decision": "RECALL",
+  "decided_by": "质检主管-陈静",
+  "basis": "批次新增花生且原放行失效，召回全部 100 张",
+  "decided_at": "2026-09-30T16:00" }
+```
+
+#### 调用示例（curl，基于演示数据）
+
+演示库 `SHIP-0001` 初始为“已出货”。先在“事件时间线”把 **BATCH-002** 加入原料 **花生碎(PEANUT-01)**
+（或用下面的接口），重算后 `LABEL-0001` 停用、`SHIP-0001` 转为待评估：
+
+```bash
+# 0) 触发待评估：BATCH-002(事件 #3) 加入花生（id 以实际 /api/state 为准，花生原料为 6）
+curl -s -X PUT http://localhost:3000/api/events/3 \
+  -H 'Content-Type: application/json' -d '{
+    "type":"PROCESS","event_time":"2026-09-30T10:00","equipment_id":1,"note":"蛋糕糊",
+    "batch_code":"BATCH-002","material_ids":[3,4,6],"ref_batch_ids":[]
+  }'
+# -> { ok:true, invalidated:[...放行#1失效...], retired_rolls:[LABEL-0001...],
+#      pending_shipments:[SHIP-0001...], stale_reviews:[] }
+
+# 1) 查询处置上下文：取得状态版本与可处置项（此时无有效放行且快照缺“花生”，只能召回）
+curl -s http://localhost:3000/api/shipments/SHIP-0001/review
+# -> { shipment_code:"SHIP-0001", shipment_status:"PENDING_REVIEW", reviewable:true,
+#      version:"<HMAC 状态版本>", business_version:"c456996faa36",
+#      can_continue:false, allowed_decisions:["RECALL"],
+#      continue_blockers:["该批次当前不存在有效放行记录",
+#                         "出货快照过敏原集合未覆盖当前批次过敏原（缺少：花生）"],
+#      current_review:null, review_history:[],
+#      shipment:{ allergen_set:["蛋","乳","芝麻"],
+#                 items:[{ roll_code:"LABEL-0001", qty:100, roll_revision:2,
+#                          release_id:1, release_at:"2026-09-30T11:30",
+#                          release_by:"质检员-王敏", allergens:["蛋","乳","芝麻"] }] },
+#      evidence:{ batch:{code:"BATCH-003", allergens:["蛋","花生","乳","芝麻"], ...},
+#                 active_releases:[],
+#                 rolls:[{ roll_code:"LABEL-0001", retired:true,
+#                          retired_reason:"绑定放行已失效：…（新增：花生）…" }] } }
+
+# 2) 强行准予继续流转 → 409，拒绝且不产生记录
+curl -s -X POST http://localhost:3000/api/shipments/SHIP-0001/reviews \
+  -H 'Content-Type: application/json' -d '{
+    "version":"<上一步的 version>","decision":"CONTINUE",
+    "decided_by":"陈静","basis":"试一下"
+  }'
+# -> { error:"当前不满足“准予继续流转”条件，只能召回：…", code:"CONTINUE_NOT_ALLOWED", ... }
+
+# 3) 召回（整单事务；成功返回最新出货单，review 为当前结论）
+curl -s -X POST http://localhost:3000/api/shipments/SHIP-0001/reviews \
+  -H 'Content-Type: application/json' -d '{
+    "version":"<上一步的 version>","decision":"RECALL",
+    "decided_by":"质检员-王敏","basis":"批次新增花生且放行失效，召回全部 100 张"
+  }'
+# -> { shipment_code:"SHIP-0001", status:"PENDING_REVIEW",
+#      review:{ id:1, decision:"RECALL", decision_text:"召回", status:"CURRENT",
+#               is_current:true, decided_by:"质检员-王敏", basis:"…",
+#               basis_version_business:"c456996faa36", ... }, items:[…快照不变…] }
+
+# 4) 同一版本再提交 → 409 VERSION_USED，旧版本不得覆盖新结论
+#    查询后任何依据变化后再用旧版本 → 409 VERSION_EXPIRED，且不产生记录
+
+# 5) 撤销花生（事件 #3 去掉花生）→ 旧 RECALL 立即置“需重新评估”，不自动生效
+curl -s -X PUT http://localhost:3000/api/events/3 \
+  -H 'Content-Type: application/json' -d '{
+    "type":"PROCESS","event_time":"2026-09-30T10:00","equipment_id":1,"note":"蛋糕糊",
+    "batch_code":"BATCH-002","material_ids":[3,4],"ref_batch_ids":[]
+  }'
+# -> stale_reviews:[{ shipment_code:"SHIP-0001", old_decision:"RECALL",
+#                     reason:"处置后批次过敏原、有效放行或所用卷停用信息发生变化，旧结论需重新评估、不自动生效：…" }]
+# 出货单仍 PENDING_REVIEW、数量仍占用 100、LABEL-0001 仍停用（可出货恒 0），旧结论保留。
+
+# 6) 重新登记有效放行后，三条件恢复满足 → 重新查询取新版本，可准予继续流转
+curl -s -X POST http://localhost:3000/api/releases -H 'Content-Type: application/json' -d '{
+  "batch_id":3,"released_at":"2026-09-30T17:00","released_by":"质检员-王敏"}'
+curl -s http://localhost:3000/api/shipments/SHIP-0001/review   # can_continue:true，取新 version
+curl -s -X POST http://localhost:3000/api/shipments/SHIP-0001/reviews \
+  -H 'Content-Type: application/json' -d '{
+    "version":"<新的 version>","decision":"CONTINUE",
+    "decided_by":"质检主管-陈静",
+    "basis":"过敏原恢复一致、有有效放行、出货快照覆盖当前集合，准予继续流转"
+  }'
+
+# 7) 查当前结论与完整历史（只增不改：CURRENT / SUPERSEDED / NEEDS_REVIEW 全留痕）
+curl -s http://localhost:3000/api/shipments/SHIP-0001/reviews
+```
+
+| 场景 | HTTP | `code` |
+| --- | --- | --- |
+| 出货单不存在（上下文 / 提交 / 历史） | 404 | `SHIPMENT_NOT_FOUND` |
+| 缺状态版本 / 操作人 / 依据、处置值非法、时间格式错、版本与出货单不匹配 | 400 | `INVALID_REQUEST` / `VERSION_INVALID` |
+| 单据不是待评估（仍为已出货） | 409 | `SHIPMENT_NOT_PENDING` |
+| 三条件不满足却提交 CONTINUE（批次缺失 / 无有效放行 / 快照不覆盖当前过敏原） | 409 | `CONTINUE_NOT_ALLOWED` |
+| 查询后依据变化或版本超过 30 分钟（拒绝且不产生记录） | 409 | `VERSION_EXPIRED` |
+| 同一状态版本重复提交 / 相同依据已有更新结论 | 409 | `VERSION_USED` / `VERSION_EXPIRED` |
+
 ## 一键启动（Docker，从空环境开始）
 
 要求安装 Docker 与 Docker Compose（v2）。在项目目录执行：
@@ -382,6 +523,8 @@ npm test             # 校验引擎：无环/成环用例
 npm run test:replan  # 启动临时端口的真实服务，端到端验证整组预演/确认应用全部语义
 npm run test:labels  # 启动临时端口的真实服务，端到端验证标签卷登记/核销/永久停用全部语义
 npm run test:shipments # 端到端验证包装出货：余额、整单事务拒绝、快照、待评估联动与换线预测
+npm run test:reviews   # 端到端验证待评估出货单质量处置：上下文、三条件、状态版本乐观并发、
+                       # 只增不改与需重新评估联动（含换线预演/应用）
 ```
 
 ## 访问地址与端口
@@ -417,7 +560,11 @@ npm run test:shipments # 端到端验证包装出货：余额、整单事务拒�
 - **包装出货**：展示各批次**可出货余额**（未停用卷的「已贴用 − 累计已分配」，点击卡片即可出货）；
   可在此录入批次、正整数出货量、各卷分配张数与操作人做整单出货确认（失败整单拒绝、不占数量），
   并列出全部出货单及其状态、逐卷明细快照（放行标识 / 过敏原 / 卷号 / 修订号）；
-  **待评估**单据黄色标注并给出逐卷停用原因，不自动恢复。
+  **待评估**单据黄色标注并给出逐卷停用原因，不自动恢复；单据上展示**当前质量处置结论**
+  （已准予继续流转 / 已召回 / 旧结论需重新评估），点击“质量处置”可在弹窗中查看
+  **出货快照与逐卷放行快照、当前批次过敏原、当前有效放行与所用卷停用原因**，
+  凭查询时取得的状态版本提交“准予继续流转 / 召回”（不满足三条件时只能召回），
+  弹窗内同时展示**只增不改的完整历史**（当前 / 已被取代 / 需重新评估）。
 - **事件时间线**：按时间排列全部加工/清洗事件，展示输入、引用批次与推导结果；
   “更正”可修改早期事件，保存时整单校验并触发重算。
 - **原料与设备**：维护原料档案（编码、名称、过敏原标签）与设备档案。
@@ -439,12 +586,13 @@ npm run test:shipments # 端到端验证包装出货：余额、整单事务拒�
 server/
   db.js          # SQLite 连接与表结构（导出 initSchema 供内存影子库复用）
   validation.js  # 全量校验（未来批次/循环/时间冲突/重复产出）
-  recompute.js   # 推导引擎：回放事件、批次并集、设备残留、放行核对、标签卷停用核对、出货单待评估核对
+  recompute.js   # 推导引擎：回放事件、批次并集、设备残留、放行核对、标签卷停用核对、出货单待评估/处置需重新评估核对
   labels.js      # 过敏原标签卷：三方一致登记、按修订号核销、永久停用
   shipments.js   # 包装出货：整单事务分配、快照保存、可出货余额、待评估联动（不自动恢复）
-  replan.js      # 整组换线：影子库预演、业务版本签名令牌、事务确认应用
+  reviews.js     # 待评估出货单质量处置：处置上下文、三条件判定、状态版本 HMAC 令牌、事务提交（乐观并发/只增不改）、需重新评估联动
+  replan.js      # 整组换线：影子库预演、业务版本签名令牌、事务确认应用（含处置需重新评估预测）
   seed.js        # 首次启动演示数据（含一卷演示标签卷与一张演示出货单）
-  server.js      # Express API 与静态页面（含 /api/label-rolls、/api/shipments、/api/replan/preview|apply）
+  server.js      # Express API 与静态页面（含 /api/label-rolls、/api/shipments、/api/shipments/:id/review(s)、/api/replan/preview|apply）
 public/
   index.html  styles.css  app.js
 scripts/
@@ -452,5 +600,6 @@ scripts/
   test-replan.js     # 整组预演/确认应用端到端测试
   test-labels.js     # 标签卷登记/核销/停用端到端测试
   test-shipments.js  # 包装出货：余额/整单事务/快照/待评估联动端到端测试
+  test-reviews.js    # 待评估出货质量处置：三条件/状态版本/只增不改/需重新评估联动端到端测试
 Dockerfile  docker-compose.yml
 ```
